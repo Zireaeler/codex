@@ -26,10 +26,13 @@
 //! back. This avoids duplicate handshakes but means a failed prewarm can consume one retry
 //! budget slot before any turn payload is sent.
 
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use crate::api_bridge::CoreAuthProvider;
 use crate::api_bridge::auth_provider_from_auth;
@@ -75,6 +78,7 @@ use http::HeaderMap as ApiHeaderMap;
 use http::HeaderValue;
 use http::StatusCode as HttpStatusCode;
 use reqwest::StatusCode;
+use serde_json::json;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -105,6 +109,19 @@ pub const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 pub const X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER: &str =
     "x-responsesapi-include-timing-metrics";
 const RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
+
+/// When set, Codex appends every outgoing `ResponsesApiRequest` payload (JSONL) to this file path.
+///
+/// This is intentionally request-body only (no auth headers) so it can be used for debugging
+/// without leaking credentials.
+const CODEX_CAPTURE_RESPONSES_REQUESTS_PATH_ENV_VAR: &str = "CODEX_CAPTURE_RESPONSES_REQUESTS_PATH";
+
+/// When set, Codex appends every incoming Responses streaming event (JSONL) to this file path.
+///
+/// This is intentionally event-body only (no auth headers) so it can be used for debugging
+/// without leaking credentials.
+const CODEX_CAPTURE_RESPONSES_EVENTS_PATH_ENV_VAR: &str = "CODEX_CAPTURE_RESPONSES_EVENTS_PATH";
+
 /// Session-scoped state shared by all [`ModelClient`] clones.
 ///
 /// This is intentionally kept minimal so `ModelClient` does not need to hold a full `Config`. Most
@@ -513,6 +530,25 @@ impl ModelClientSession {
             prompt_cache_key,
             text,
         };
+        if let Ok(path) = std::env::var(CODEX_CAPTURE_RESPONSES_REQUESTS_PATH_ENV_VAR)
+            && let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+        {
+            let ts_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default();
+            let entry = json!({
+                "ts_ms": ts_ms,
+                "conversation_id": self.client.state.conversation_id.to_string(),
+                "request": request,
+            });
+            // Best-effort logging; never fail the user session because debug logging failed.
+            let _ = serde_json::to_writer(&mut file, &entry);
+            let _ = writeln!(&mut file);
+        }
         Ok(request)
     }
 
@@ -731,7 +767,11 @@ impl ModelClientSession {
                 self.client.state.provider.stream_idle_timeout(),
             )
             .map_err(map_api_error)?;
-            let (stream, _last_request_rx) = map_response_stream(stream, otel_manager.clone());
+            let (stream, _last_request_rx) = map_response_stream(
+                stream,
+                otel_manager.clone(),
+                self.client.state.conversation_id.to_string(),
+            );
             return Ok(stream);
         }
 
@@ -763,7 +803,11 @@ impl ModelClientSession {
 
             match stream_result {
                 Ok(stream) => {
-                    let (stream, _) = map_response_stream(stream, otel_manager.clone());
+                    let (stream, _) = map_response_stream(
+                        stream,
+                        otel_manager.clone(),
+                        self.client.state.conversation_id.to_string(),
+                    );
                     return Ok(stream);
                 }
                 Err(ApiError::Transport(
@@ -846,8 +890,11 @@ impl ModelClientSession {
                 .await
                 .map_err(map_api_error)?;
             self.websocket_last_request = Some(request);
-            let (stream, last_request_rx) =
-                map_response_stream(stream_result, otel_manager.clone());
+            let (stream, last_request_rx) = map_response_stream(
+                stream_result,
+                otel_manager.clone(),
+                self.client.state.conversation_id.to_string(),
+            );
             self.websocket_last_response_rx = Some(last_request_rx);
 
             return Ok(WebsocketStreamOutcome::Stream(stream));
@@ -996,6 +1043,7 @@ fn build_responses_headers(
 fn map_response_stream<S>(
     api_stream: S,
     otel_manager: OtelManager,
+    conversation_id: String,
 ) -> (ResponseStream, oneshot::Receiver<LastResponse>)
 where
     S: futures::Stream<Item = std::result::Result<ResponseEvent, ApiError>>
@@ -1011,7 +1059,31 @@ where
         let mut tx_last_response = Some(tx_last_response);
         let mut items_added: Vec<ResponseItem> = Vec::new();
         let mut api_stream = api_stream;
+        let mut capture_file = std::env::var(CODEX_CAPTURE_RESPONSES_EVENTS_PATH_ENV_VAR)
+            .ok()
+            .and_then(|path| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .ok()
+            });
         while let Some(event) = api_stream.next().await {
+            if let Some(file) = capture_file.as_mut()
+                && let Ok(ok_event) = &event
+            {
+                let ts_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or_default();
+                let entry = json!({
+                    "ts_ms": ts_ms,
+                    "conversation_id": &conversation_id,
+                    "event": ok_event,
+                });
+                let _ = serde_json::to_writer(&mut *file, &entry);
+                let _ = writeln!(file);
+            }
             match event {
                 Ok(ResponseEvent::OutputItemDone(item)) => {
                     items_added.push(item.clone());
@@ -1063,6 +1135,19 @@ where
                 }
                 Err(err) => {
                     let mapped = map_api_error(err);
+                    if let Some(file) = capture_file.as_mut() {
+                        let ts_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or_default();
+                        let entry = json!({
+                            "ts_ms": ts_ms,
+                            "conversation_id": &conversation_id,
+                            "error": mapped.to_string(),
+                        });
+                        let _ = serde_json::to_writer(&mut *file, &entry);
+                        let _ = writeln!(file);
+                    }
                     if !logged_error {
                         otel_manager.see_event_completed_failed(&mapped);
                         logged_error = true;

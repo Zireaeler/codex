@@ -51,7 +51,7 @@ pub struct MemorySummarizeOutput {
     pub memory_summary: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub enum ResponseEvent {
     Created,
     OutputItemDone(ResponseItem),
