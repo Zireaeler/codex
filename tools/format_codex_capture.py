@@ -135,7 +135,8 @@ def summarize_input_item(item: dict[str, Any], *, text_limit: int) -> str:
             return f"- `user`: `<environment_context omitted ({len(text)} chars)>`"
         if role == "assistant" and not text:
             return "- `assistant`: <empty>"
-        return f"- `{role}`: {truncate(text.replace('\\r', ''), text_limit)}"
+        clean_text = text.replace("\r", "")
+        return f"- `{role}`: {truncate(clean_text, text_limit)}"
 
     if t == "function_call":
         name = item.get("name", "<missing-name>")

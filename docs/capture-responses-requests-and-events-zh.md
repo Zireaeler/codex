@@ -116,3 +116,59 @@ python .\tools\format_codex_capture.py `
 
 因此不建议把 `capture_*.jsonl` 直接提交到公共仓库。
 
+
+## 6. 常见故障排查（容器内）
+
+### 6.1 `codex-cli` 编译卡在 `codex-linux-sandbox` / `libcap`
+
+如果日志里出现 `libcap not available via pkg-config`，说明系统里只有运行时库（`libcap.so.2`），缺少开发头/`libcap.pc`。
+
+在无法 `apt install libcap-dev` 的受限容器里，可临时用本地 shim 方式继续编译：
+
+```bash
+mkdir -p .tmpdeps/libcap-dev/include/sys .tmpdeps/libcap-dev/lib/pkgconfig .tmpdeps/libcap-dev/lib
+curl -L -o .tmpdeps/libcap-dev/include/sys/capability.h \
+  https://raw.githubusercontent.com/Distrotech/libcap/master/libcap/include/sys/capability.h
+ln -sf /lib/x86_64-linux-gnu/libcap.so.2 .tmpdeps/libcap-dev/lib/libcap.so
+cat > .tmpdeps/libcap-dev/lib/pkgconfig/libcap.pc <<'EOF'
+prefix=$PWD/.tmpdeps/libcap-dev
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: libcap
+Description: local shim for libcap runtime-only env
+Version: 2.66
+Libs: -L${libdir} -lcap
+Cflags: -I${includedir}
+EOF
+
+cd codex-rs
+PKG_CONFIG_PATH="$PWD/../.tmpdeps/libcap-dev/lib/pkgconfig" cargo build -p codex-cli
+```
+
+> 注意：这是容器内临时方案，优先仍是安装正式的 `libcap-dev`。
+
+### 6.2 验证 `CODEX_HOME` 与 `auth.json` 是否一致
+
+当你看到 `Token data is not available.`，先确认运行时读取的 `auth.json` 路径是否正确（且文件里确实有 token）：
+
+```bash
+ls -la "$CODEX_HOME"
+python3 - <<'PY'
+import json, os
+p = os.path.join(os.environ["CODEX_HOME"], "auth.json")
+j = json.load(open(p, "r", encoding="utf-8"))
+print("keys:", sorted(j.keys()))
+print("has_tokens:", "tokens" in j and j["tokens"] is not None)
+print("has_last_refresh:", j.get("last_refresh") is not None)
+if isinstance(j.get("tokens"), dict):
+    print("token_keys:", sorted(j["tokens"].keys()))
+PY
+```
+
+若 `has_tokens` 为 `False`，说明是登录态问题，不是网络连通性问题。建议优先在同一个 `CODEX_HOME` 下重新登录：
+
+```bash
+codex login --device-auth
+```
